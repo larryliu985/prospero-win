@@ -196,6 +196,7 @@ wine/patches/0110-server-run-in-process-on-ps5.patch
 wine/patches/0120-server-ps5-default-audio-driver.patch
 wine/patches/0130-ntdll-ps5-report-main-exe-load-failure.patch
 wine/patches/0140-ntdll-ps5-list-directory-by-name.patch
+wine/patches/0145-ntdll-ps5-resolve-names-under-a-root-directory.patch
 wine/patches/0150-server-ps5-save-the-registry-in-1mib-writes.patch
 wine/patches/0160-ntdll-ps5-keep-listings-of-searched-directories.patch
 wine/patches/0111-ntdll-connect-to-the-in-process-server.patch
@@ -311,6 +312,7 @@ tests/test_pw_lapy_elevation.c
 tests/test_pw_wine_cwd.c
 tests/test_pw_wine_cwd_listing.c
 tests/test_wine_lookup_misses.py
+tests/test_wine_root_directory.py
 wine/ps5/pw_wine_cwd.c
 wine/ps5/pw_wine_cwd.h
 wine/ps5/pw_wine_cwd_libc.c
