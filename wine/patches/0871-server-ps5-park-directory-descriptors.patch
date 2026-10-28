@@ -12,8 +12,10 @@ directories open at once, close a directory's descriptor once its open has
 been checked, and open it again by name the first time it is needed:
 get_unix_fd, dup_fd_object, locks, reparse points, disposition, rename and
 end of file. The name must lead to a directory with the same device and
-inode, opened with O_DIRECTORY, or the handle fails. A dismounted directory
-is never opened again. WINE_PS5_PARK_DIRECTORIES=0 parks nothing, =N moves
+inode, opened with O_DIRECTORY, or the handle fails; renaming the directory
+through another handle gives the parked ones its new name. A dismounted
+directory is never opened again. Whether an fd is parked is tested inline,
+so one that is not costs no call. WINE_PS5_PARK_DIRECTORIES=0 parks nothing, =N moves
 the threshold.
 
 tests/test_wine_directory_handles.py lists 3001 directories with each
@@ -21,11 +23,11 @@ one's handle queued, as .NET does. Under a host Wine and a 512-descriptor
 limit, the stock server fails it with STATUS_TOO_MANY_OPENED_FILES at about
 230 queued handles; one built with PS5_PARK_DIRECTORIES completes it.
 ---
- server/fd.c | 135 +++++++++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 133 insertions(+), 2 deletions(-)
+ server/fd.c | 157 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 155 insertions(+), 2 deletions(-)
 
 diff --git a/server/fd.c b/server/fd.c
-index bce9a84..b6e92e1 100644
+index 6c254e6..dedaa63 100644
 --- a/server/fd.c
 +++ b/server/fd.c
 @@ -132,6 +132,10 @@ struct closed_fd
@@ -39,7 +41,7 @@ index bce9a84..b6e92e1 100644
  struct fd
  {
      struct object        obj;         /* object header */
-@@ -161,8 +165,18 @@ struct fd
+@@ -161,8 +165,25 @@ struct fd
      struct completion   *completion;  /* completion object attached to this fd */
      apc_param_t          comp_key;    /* completion key to set in completion events */
      unsigned int         comp_flags;  /* completion flags */
@@ -52,13 +54,20 @@ index bce9a84..b6e92e1 100644
  
 +#ifdef PS5_PARK_DIRECTORIES
 +static unsigned int ps5_directory_fds;  /* directory fds alive, parked or not (see ps5_park_directory) */
-+static int ps5_unpark_directory( struct fd *fd );
++static int ps5_reopen_directory( struct fd *fd );
++
++/* 0 when the fd has its unix_fd (again), -1 with the error set. Inline, so
++ * an fd that is not parked costs one test and no call. */
++static inline int ps5_unpark_directory( struct fd *fd )
++{
++    return fd->ps5_parked ? ps5_reopen_directory( fd ) : 0;
++}
 +#endif
 +
  static void fd_dump( struct object *obj, int verbose );
  static struct object *fd_get_sync( struct object *obj );
  static void fd_destroy( struct object *obj );
-@@ -1577,6 +1591,9 @@ obj_handle_t lock_fd( struct fd *fd, file_pos_t start, file_pos_t count, int sha
+@@ -1577,6 +1598,9 @@ obj_handle_t lock_fd( struct fd *fd, file_pos_t start, file_pos_t count, int sha
          set_error( STATUS_INVALID_DEVICE_REQUEST );
          return 0;
      }
@@ -68,7 +77,7 @@ index bce9a84..b6e92e1 100644
  
      /* don't allow wrapping locks */
      if (end && end < start)
-@@ -1654,6 +1671,9 @@ static void fd_destroy( struct object *obj )
+@@ -1654,6 +1678,9 @@ static void fd_destroy( struct object *obj )
      free_async_queue( &fd->write_q );
      free_async_queue( &fd->wait_q );
  
@@ -78,7 +87,7 @@ index bce9a84..b6e92e1 100644
      if (fd->map_addr) free_map_addr( fd->map_addr, fd->map_size );
      if (fd->completion) release_object( fd->completion );
      remove_fd_locks( fd );
-@@ -1764,6 +1784,9 @@ static inline void unmount_fd( struct fd *fd )
+@@ -1764,6 +1791,9 @@ static inline void unmount_fd( struct fd *fd )
      fd->unix_fd = -1;
      fd->no_fd_status = STATUS_VOLUME_DISMOUNTED;
      fd->closed->unix_fd = -1;
@@ -88,7 +97,7 @@ index bce9a84..b6e92e1 100644
      fd->closed->disp_flags = 0;
  
      /* stop using Unix locks on this fd (existing locks have been removed by close) */
-@@ -1794,6 +1817,11 @@ static struct fd *alloc_fd_object(void)
+@@ -1794,6 +1824,11 @@ static struct fd *alloc_fd_object(void)
      fd->cacheable  = 0;
      fd->fs_locks   = 1;
      fd->poll_index = -1;
@@ -100,7 +109,7 @@ index bce9a84..b6e92e1 100644
      fd->completion = NULL;
      fd->comp_flags = 0;
      init_async_queue( &fd->read_q );
-@@ -1839,6 +1867,11 @@ struct fd *alloc_pseudo_fd( const struct fd_ops *fd_user_ops, struct object *use
+@@ -1839,6 +1874,11 @@ struct fd *alloc_pseudo_fd( const struct fd_ops *fd_user_ops, struct object *use
      fd->completion = NULL;
      fd->comp_flags = 0;
      fd->no_fd_status = STATUS_BAD_DEVICE_TYPE;
@@ -112,7 +121,7 @@ index bce9a84..b6e92e1 100644
      init_async_queue( &fd->read_q );
      init_async_queue( &fd->write_q );
      init_async_queue( &fd->wait_q );
-@@ -1853,13 +1886,96 @@ struct fd *alloc_pseudo_fd( const struct fd_ops *fd_user_ops, struct object *use
+@@ -1853,13 +1893,95 @@ struct fd *alloc_pseudo_fd( const struct fd_ops *fd_user_ops, struct object *use
      return fd;
  }
  
@@ -168,13 +177,12 @@ index bce9a84..b6e92e1 100644
 +    fd->ps5_parked = 1;
 +}
 +
-+/* 0 when the fd has its unix_fd (again), -1 with the error set */
-+static int ps5_unpark_directory( struct fd *fd )
++/* a parked fd's unix_fd, opened again by its name (see ps5_unpark_directory) */
++static int ps5_reopen_directory( struct fd *fd )
 +{
 +    struct stat st;
 +    int unix_fd;
 +
-+    if (!fd->ps5_parked) return 0;
 +    if ((unix_fd = open( fd->unix_name, fd->ps5_park_flags )) == -1)
 +    {
 +        file_set_error();
@@ -211,7 +219,7 @@ index bce9a84..b6e92e1 100644
  
      fd->options    = options;
      fd->cacheable  = orig->cacheable;
-@@ -2242,6 +2358,9 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
+@@ -2239,6 +2361,9 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
      }
  #endif
  
@@ -221,7 +229,7 @@ index bce9a84..b6e92e1 100644
      if (root_fd != -1) fchdir( server_dir_fd ); /* go back to the server dir */
      return fd;
  
-@@ -2297,6 +2416,9 @@ int is_fd_overlapped( struct fd *fd )
+@@ -2294,6 +2419,9 @@ int is_fd_overlapped( struct fd *fd )
  /* retrieve the unix fd for an object */
  int get_unix_fd( struct fd *fd )
  {
@@ -231,7 +239,7 @@ index bce9a84..b6e92e1 100644
      if (fd->unix_fd == -1) set_error( fd->no_fd_status );
      return fd->unix_fd;
  }
-@@ -2346,6 +2468,9 @@ int check_fd_events( struct fd *fd, int events )
+@@ -2343,6 +2471,9 @@ int check_fd_events( struct fd *fd, int events )
  {
      struct pollfd pfd;
  
@@ -241,7 +249,7 @@ index bce9a84..b6e92e1 100644
      if (fd->unix_fd == -1) return POLLERR;
      if (fd->inode) return events;  /* regular files are always signaled */
  
-@@ -2617,6 +2742,7 @@ static void set_reparse_point( struct fd *fd, struct async *async )
+@@ -2614,6 +2745,7 @@ static void set_reparse_point( struct fd *fd, struct async *async )
      struct stat st;
      size_t len;
  
@@ -249,7 +257,7 @@ index bce9a84..b6e92e1 100644
      if (!fd->unix_name)
      {
          set_error( STATUS_OBJECT_TYPE_MISMATCH );
-@@ -2668,6 +2794,7 @@ static void get_reparse_point( struct fd *fd, struct async *async )
+@@ -2665,6 +2797,7 @@ static void get_reparse_point( struct fd *fd, struct async *async )
      char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
      int ret;
  
@@ -257,7 +265,7 @@ index bce9a84..b6e92e1 100644
      if (!fd->unix_name)
      {
          set_error( STATUS_OBJECT_TYPE_MISMATCH );
-@@ -2711,6 +2838,7 @@ static void delete_reparse_point( struct fd *fd, struct async *async )
+@@ -2708,6 +2841,7 @@ static void delete_reparse_point( struct fd *fd, struct async *async )
      char *base_name;
      size_t len;
  
@@ -265,7 +273,7 @@ index bce9a84..b6e92e1 100644
      if (!fd->unix_name)
      {
          set_error( STATUS_OBJECT_TYPE_MISMATCH );
-@@ -2879,6 +3007,7 @@ static void set_fd_disposition( struct fd *fd, unsigned int flags )
+@@ -2876,6 +3010,7 @@ static void set_fd_disposition( struct fd *fd, unsigned int flags )
  {
      struct stat st;
  
@@ -273,7 +281,7 @@ index bce9a84..b6e92e1 100644
      if (!fd->inode)
      {
          set_error( STATUS_OBJECT_TYPE_MISMATCH );
-@@ -2954,6 +3083,7 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
+@@ -2951,6 +3086,7 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
      char *name;
      const unsigned int replace = flags & FILE_RENAME_REPLACE_IF_EXISTS;
  
@@ -281,7 +289,30 @@ index bce9a84..b6e92e1 100644
      if (!fd->inode || !fd->unix_name)
      {
          set_error( STATUS_OBJECT_TYPE_MISMATCH );
-@@ -3096,6 +3226,7 @@ static void set_fd_eof( struct fd *fd, file_pos_t eof )
+@@ -3077,6 +3213,22 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
+     free( name );
+     if (!fd->unix_name)
+         set_error( STATUS_NO_MEMORY );
++#ifdef PS5_PARK_DIRECTORIES
++    else
++    {
++        /* other handles to this directory that are parked open it again by
++         * its new name */
++        struct fd *fd_ptr;
++        char *unix_name;
++
++        LIST_FOR_EACH_ENTRY( fd_ptr, &fd->inode->open, struct fd, inode_entry )
++        {
++            if (!fd_ptr->ps5_parked || !(unix_name = strdup( fd->unix_name ))) continue;
++            free( fd_ptr->unix_name );
++            fd_ptr->closed->unix_name = fd_ptr->unix_name = unix_name;
++        }
++    }
++#endif
+     return;
+ 
+ failed:
+@@ -3093,6 +3245,7 @@ static void set_fd_eof( struct fd *fd, file_pos_t eof )
          return;
      }
  
